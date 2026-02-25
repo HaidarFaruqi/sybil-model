@@ -1,84 +1,113 @@
-import os
-import pandas as pd
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from sklearn.preprocessing import StandardScaler
-import joblib
+import pandas as pd
 import numpy as np
+from sklearn.preprocessing import StandardScaler
 
-# =====================
-# 1. LOAD DATA
-# =====================
-path = r'C:\Users\ASUS\.cache\kagglehub\datasets\chethuhn\network-intrusion-dataset\versions\1'
-file_name = 'Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv'
-full_path = os.path.join(path, file_name)
+# =============================
+# MODEL
+# =============================
 
-print("Loading dataset...")
-df = pd.read_csv(full_path)
+class AutoEncoder(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
 
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
+            nn.ReLU()
+        )
+
+        self.decoder = nn.Sequential(
+            nn.Linear(16, 32),
+            nn.ReLU(),
+            nn.Linear(32, input_dim)
+        )
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
+
+
+# =============================
+# LOAD DATA
+# =============================
+
+df = pd.read_csv("Monday-WorkingHours.pcap_ISCX.csv")
+
+# rapikan kolom (penting untuk CICIDS)
 df.columns = df.columns.str.strip()
 
+if "Label" in df.columns:
+    df = df[df["Label"] == "BENIGN"]
+
+df.replace([np.inf, -np.inf], 0, inplace=True)
+df.fillna(0, inplace=True)
+
 features = [
-    'Flow Duration',
-    'Total Fwd Packets',
-    'Total Backward Packets',
-    'Bwd Packet Length Mean'
+    "Flow Duration",
+    "Total Fwd Packets",
+    "Total Backward Packets",
+    "Total Length of Fwd Packets",
+    "Total Length of Bwd Packets",
+    "Flow Bytes/s",
+    "Flow Packets/s",
+    "Fwd Packet Length Mean",
+    "Bwd Packet Length Mean",
+    "SYN Flag Count",
+    "RST Flag Count",
+    "PSH Flag Count",
+    "ACK Flag Count",
+    "Average Packet Size"
 ]
 
-df = df[features + ['Label']]
-df = df.replace([np.inf, -np.inf], np.nan).dropna()
-
-# =====================
-# 2. FEATURE ENGINEERING
-# =====================
 X = df[features].values
 
-# LOG TRANSFORM untuk stabilitas
-X[:,1] = np.log1p(X[:,1])
-X[:,2] = np.log1p(X[:,2])
-X[:,3] = np.log1p(X[:,3])
-
-y = df['Label'].apply(lambda x: 0 if x == 'BENIGN' else 1).values.reshape(-1,1)
+# =============================
+# SCALING
+# =============================
 
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
-# =====================
-# 3. MODEL
-# =====================
-class SybilModel(nn.Module):
-    def __init__(self):
-        super(SybilModel, self).__init__()
-        self.layer = nn.Sequential(
-            nn.Linear(4, 32),
-            nn.ReLU(),
-            nn.Linear(32, 16),
-            nn.ReLU(),
-            nn.Linear(16, 1),
-            nn.Sigmoid()
-        )
-    def forward(self, x):
-        return self.layer(x)
+X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
 
-model = SybilModel()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-criterion = nn.BCELoss()
+# =============================
+# TRAIN
+# =============================
 
-X_tensor = torch.FloatTensor(X_scaled)
-y_tensor = torch.FloatTensor(y)
+model = AutoEncoder(input_dim=X_tensor.shape[1])
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+criterion = nn.MSELoss()
 
-print("Training...")
-for epoch in range(50):
+for epoch in range(30):
     optimizer.zero_grad()
-    outputs = model(X_tensor)
-    loss = criterion(outputs, y_tensor)
+    output = model(X_tensor)
+    loss = criterion(output, X_tensor)
     loss.backward()
     optimizer.step()
-    if epoch % 10 == 0:
-        print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
 
-torch.save(model.state_dict(), "sybil_detector_real.pt")
-joblib.dump(scaler, "scaler_sybil.pkl")
+    print(f"Epoch {epoch+1}, Loss: {loss.item()}")
 
-print("✅ Training selesai & model disimpan!")
+# =============================
+# THRESHOLD
+# =============================
+
+with torch.no_grad():
+    reconstructed = model(X_tensor)
+    mse = torch.mean((X_tensor - reconstructed) ** 2, dim=1)
+
+threshold = mse.mean() + 3 * mse.std()
+
+# =============================
+# SAVE SEMUA KE .pt
+# =============================
+
+torch.save({
+    "model_state_dict": model.state_dict(),
+    "scaler_mean": scaler.mean_,
+    "scaler_scale": scaler.scale_,
+    "threshold": threshold
+}, "sybil_detector_real.pt")
+
+print("Model saved successfully.")

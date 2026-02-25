@@ -1,91 +1,126 @@
 import torch
 import torch.nn as nn
-import joblib
+import pandas as pd
 import numpy as np
-from scapy.all import sniff, IP, TCP
-import time
-from collections import defaultdict
+from sklearn.preprocessing import StandardScaler
 
-# =====================
-# MODEL (HARUS SAMA)
-# =====================
-class SybilModel(nn.Module):
-    def __init__(self):
-        super(SybilModel, self).__init__()
-        self.layer = nn.Sequential(
-            nn.Linear(4, 32),
+# =============================
+# MODEL (HARUS IDENTIK DENGAN TRAINING)
+# =============================
+
+class AutoEncoder(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 32),
             nn.ReLU(),
             nn.Linear(32, 16),
-            nn.ReLU(),
-            nn.Linear(16, 1),
-            nn.Sigmoid()
+            nn.ReLU()
         )
-    def forward(self, x):
-        return self.layer(x)
 
-device = torch.device('cpu')
-model = SybilModel()
-model.load_state_dict(torch.load('sybil_detector_real.pt', map_location=device))
+        self.decoder = nn.Sequential(
+            nn.Linear(16, 32),
+            nn.ReLU(),
+            nn.Linear(32, input_dim)
+        )
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
+
+
+# =============================
+# LOAD MODEL CHECKPOINT
+# =============================
+
+checkpoint = torch.load("sybil_detector_real.pt")
+
+threshold = checkpoint["threshold"]
+
+# =============================
+# FEATURES (WAJIB SAMA & URUTAN SAMA)
+# =============================
+
+features = [
+    "Flow Duration",
+    "Total Fwd Packets",
+    "Total Backward Packets",
+    "Total Length of Fwd Packets",
+    "Total Length of Bwd Packets",
+    "Flow Bytes/s",
+    "Flow Packets/s",
+    "Fwd Packet Length Mean",
+    "Bwd Packet Length Mean",
+    "SYN Flag Count",
+    "RST Flag Count",
+    "PSH Flag Count",
+    "ACK Flag Count",
+    "Average Packet Size"
+]
+
+# =============================
+# REBUILD MODEL
+# =============================
+
+input_dim = len(features)
+model = AutoEncoder(input_dim)
+model.load_state_dict(checkpoint["model_state_dict"])
 model.eval()
 
-scaler = joblib.load('scaler_sybil.pkl')
+# =============================
+# REBUILD SCALER (DARI TRAINING)
+# =============================
 
-print("✅ Model Loaded!")
+scaler = StandardScaler()
+scaler.mean_ = checkpoint["scaler_mean"]
+scaler.scale_ = checkpoint["scaler_scale"]
+scaler.n_features_in_ = len(features)
 
-# =====================
-# FLOW STORAGE
-# =====================
-flows = defaultdict(lambda: {
-    "start_time": time.time(),
-    "fwd": 0,
-    "bwd": 0,
-    "bwd_lengths": []
-})
+# =============================
+# LOAD TEST DATA
+# =============================
 
-WINDOW = 3  # seconds
+df = pd.read_csv("test_traffic.csv")
 
-def process_flow(key):
-    flow = flows[key]
-    duration = (time.time() - flow["start_time"]) * 1_000_000  # microseconds
-    
-    if flow["fwd"] + flow["bwd"] < 2:
-        return
-    
-    fwd = np.log1p(flow["fwd"])
-    bwd = np.log1p(flow["bwd"])
-    bwd_mean = np.log1p(np.mean(flow["bwd_lengths"])) if flow["bwd_lengths"] else 0
-    
-    features = np.array([[duration, fwd, bwd, bwd_mean]])
-    features_scaled = scaler.transform(features)
-    
-    with torch.no_grad():
-        score = model(torch.FloatTensor(features_scaled)).item()
-    
-    if score > 0.85:
-        print(f"🚨 SYBIL/DDOS DETECTED | Score: {score:.4f} | Flow: {key}")
-    else:
-        print(f"Healthy | Score: {score:.4f}")
+df.columns = df.columns.str.strip()
+df.replace([np.inf, -np.inf], 0, inplace=True)
+df.fillna(0, inplace=True)
 
-def packet_callback(packet):
-    if IP in packet and TCP in packet:
-        key = (
-            packet[IP].src,
-            packet[IP].dst,
-            packet[TCP].sport,
-            packet[TCP].dport
-        )
-        
-        flow = flows[key]
-        
-        if packet[IP].src == key[0]:
-            flow["fwd"] += 1
-        else:
-            flow["bwd"] += 1
-            flow["bwd_lengths"].append(len(packet))
-        
-        if time.time() - flow["start_time"] > WINDOW:
-            process_flow(key)
-            del flows[key]
+# Pastikan semua fitur ada
+missing = [f for f in features if f not in df.columns]
+if len(missing) > 0:
+    raise ValueError(f"Missing features in test data: {missing}")
 
-print("🔍 Monitoring Port 80...")
-sniff(filter="tcp port 80", prn=packet_callback, store=0)
+X = df[features].values
+X_scaled = scaler.transform(X)
+
+X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
+
+# =============================
+# DETECTION
+# =============================
+
+with torch.no_grad():
+    reconstructed = model(X_tensor)
+    mse = torch.mean((X_tensor - reconstructed) ** 2, dim=1)
+
+# Convert ke numpy
+mse_np = mse.numpy()
+
+df["Anomaly_Score"] = mse_np
+df["Prediction"] = ["ANOMALY" if err > threshold else "NORMAL" for err in mse_np]
+
+# =============================
+# OUTPUT SUMMARY
+# =============================
+
+print("\n=== DETECTION SUMMARY ===")
+print(df["Prediction"].value_counts())
+
+anomaly_ratio = (df["Prediction"] == "ANOMALY").mean() * 100
+print(f"\nAnomaly Percentage: {anomaly_ratio:.2f}%")
+
+# Save result
+df.to_csv("detection_result.csv", index=False)
+
+print("\nDetection finished. Results saved to detection_result.csv")
