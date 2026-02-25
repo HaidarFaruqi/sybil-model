@@ -3,23 +3,19 @@ import torch.nn as nn
 import joblib
 import numpy as np
 from scapy.all import sniff, IP, TCP
-import logging
 import time
-from collections import Counter
+from collections import defaultdict
 
-# 1. Konfigurasi Logging (Data untuk Bab IV)
-logging.basicConfig(
-    filename='/var/log/hybrid_alerts.log',
-    level=logging.INFO,
-    format='%(asctime)s [HYBRID-IDS] %(message)s'
-)
-
-# 2. Arsitektur Model (Wajib SAMA dengan saat training)
+# =====================
+# MODEL (HARUS SAMA)
+# =====================
 class SybilModel(nn.Module):
     def __init__(self):
         super(SybilModel, self).__init__()
         self.layer = nn.Sequential(
-            nn.Linear(4, 16), # 4 Fitur input, 16 Hidden
+            nn.Linear(4, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
             nn.ReLU(),
             nn.Linear(16, 1),
             nn.Sigmoid()
@@ -27,69 +23,69 @@ class SybilModel(nn.Module):
     def forward(self, x):
         return self.layer(x)
 
-# 3. Load Model dan Scaler
 device = torch.device('cpu')
 model = SybilModel()
+model.load_state_dict(torch.load('sybil_detector_real.pt', map_location=device))
+model.eval()
 
-try:
-    model.load_state_dict(torch.load('sybil_detector_real.pt', map_location=device))
-    model.eval()
-    scaler = joblib.load('scaler_sybil.pkl')
-    print("✅ Model & Scaler berhasil dimuat!")
-except Exception as e:
-    print(f"❌ Gagal memuat file: {e}")
-    exit()
+scaler = joblib.load('scaler_sybil.pkl')
 
-# Variabel bantu untuk menghitung fitur secara real-time
-packet_count = 0
-bwd_lengths = []
-start_time = time.time()
+print("✅ Model Loaded!")
 
-def process_and_predict():
-    global packet_count, bwd_lengths, start_time
+# =====================
+# FLOW STORAGE
+# =====================
+flows = defaultdict(lambda: {
+    "start_time": time.time(),
+    "fwd": 0,
+    "bwd": 0,
+    "bwd_lengths": []
+})
+
+WINDOW = 3  # seconds
+
+def process_flow(key):
+    flow = flows[key]
+    duration = (time.time() - flow["start_time"]) * 1_000_000  # microseconds
     
-    end_time = time.time()
-    duration = end_time - start_time
+    if flow["fwd"] + flow["bwd"] < 2:
+        return
     
-    if packet_count > 0:
-        # Ekstraksi 4 Fitur sesuai training kamu:
-        # ['Flow Duration', 'Total Fwd Packets', 'Total Backward Packets', 'Bwd Packet Length Mean']
-        fwd_pkts = packet_count * 0.6  # Estimasi pembagian fwd/bwd
-        bwd_pkts = packet_count * 0.4
-        bwd_mean = np.mean(bwd_lengths) if bwd_lengths else 0
-        
-        features = np.array([[duration, fwd_pkts, bwd_pkts, bwd_mean]])
-        
-        # WAJIB: Scaling data mentah
-        features_scaled = scaler.transform(features)
-        input_tensor = torch.FloatTensor(features_scaled)
-        
-        with torch.no_grad():
-            score = model(input_tensor).item()
-            
-        # Jika skor tinggi, catat sebagai anomali
-        if score > 0.85:
-            msg = f"ANOMALY_DETECTED | Sybil Attack | Score: {score:.4f} | Pkts: {packet_count}"
-            print(f"🚨 {msg}")
-            logging.info(msg)
-        else:
-            print(f"Healthy Traffic (Score: {score:.4f})")
-
-    # Reset counter untuk window berikutnya
-    packet_count = 0
-    bwd_lengths = []
-    start_time = time.time()
+    fwd = np.log1p(flow["fwd"])
+    bwd = np.log1p(flow["bwd"])
+    bwd_mean = np.log1p(np.mean(flow["bwd_lengths"])) if flow["bwd_lengths"] else 0
+    
+    features = np.array([[duration, fwd, bwd, bwd_mean]])
+    features_scaled = scaler.transform(features)
+    
+    with torch.no_grad():
+        score = model(torch.FloatTensor(features_scaled)).item()
+    
+    if score > 0.85:
+        print(f"🚨 SYBIL/DDOS DETECTED | Score: {score:.4f} | Flow: {key}")
+    else:
+        print(f"Healthy | Score: {score:.4f}")
 
 def packet_callback(packet):
-    global packet_count, bwd_lengths
-    if IP in packet:
-        packet_count += 1
-        if packet.haslayer(TCP):
-            bwd_lengths.append(len(packet))
+    if IP in packet and TCP in packet:
+        key = (
+            packet[IP].src,
+            packet[IP].dst,
+            packet[TCP].sport,
+            packet[TCP].dport
+        )
         
-        # Periksa setiap 2 detik (Windowing)
-        if time.time() - start_time > 2:
-            process_and_predict()
+        flow = flows[key]
+        
+        if packet[IP].src == key[0]:
+            flow["fwd"] += 1
+        else:
+            flow["bwd"] += 1
+            flow["bwd_lengths"].append(len(packet))
+        
+        if time.time() - flow["start_time"] > WINDOW:
+            process_flow(key)
+            del flows[key]
 
-print("🔍 IDS AI sedang memantau Port 80 (Web)...")
+print("🔍 Monitoring Port 80...")
 sniff(filter="tcp port 80", prn=packet_callback, store=0)

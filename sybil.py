@@ -5,35 +5,55 @@ import torch.nn as nn
 import torch.optim as optim
 from sklearn.preprocessing import StandardScaler
 import joblib
+import numpy as np
 
-
-# 1. Tentukan Path File (Gunakan file Friday untuk Sybil/DDoS)
+# =====================
+# 1. LOAD DATA
+# =====================
 path = r'C:\Users\ASUS\.cache\kagglehub\datasets\chethuhn\network-intrusion-dataset\versions\1'
 file_name = 'Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv'
 full_path = os.path.join(path, file_name)
 
-# 2. Load Data (Gunakan nrows jika RAM laptop terbatas)
-print(f"Sedang memuat data dari: {file_name}")
-df = pd.read_csv(full_path, nrows=50000) 
+print("Loading dataset...")
+df = pd.read_csv(full_path)
 
-# Bersihkan nama kolom (dataset ini sering punya spasi di awal nama kolom)
 df.columns = df.columns.str.strip()
 
-# 3. Preprocessing Sederhana
-# Fitur penting untuk Sybil: Bwd Packet Length, Flow Duration, Total Fwd Packets
-features = ['Flow Duration', 'Total Fwd Packets', 'Total Backward Packets', 'Bwd Packet Length Mean']
-X = df[features].fillna(0).values
-y = df['Label'].apply(lambda x: 0 if x == 'BENIGN' else 1).values.reshape(-1, 1)
+features = [
+    'Flow Duration',
+    'Total Fwd Packets',
+    'Total Backward Packets',
+    'Bwd Packet Length Mean'
+]
+
+df = df[features + ['Label']]
+df = df.replace([np.inf, -np.inf], np.nan).dropna()
+
+# =====================
+# 2. FEATURE ENGINEERING
+# =====================
+X = df[features].values
+
+# LOG TRANSFORM untuk stabilitas
+X[:,1] = np.log1p(X[:,1])
+X[:,2] = np.log1p(X[:,2])
+X[:,3] = np.log1p(X[:,3])
+
+y = df['Label'].apply(lambda x: 0 if x == 'BENIGN' else 1).values.reshape(-1,1)
 
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
-# 4. Arsitektur Model Hybrid IDS
+# =====================
+# 3. MODEL
+# =====================
 class SybilModel(nn.Module):
     def __init__(self):
         super(SybilModel, self).__init__()
         self.layer = nn.Sequential(
-            nn.Linear(len(features), 16),
+            nn.Linear(4, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
             nn.ReLU(),
             nn.Linear(16, 1),
             nn.Sigmoid()
@@ -41,26 +61,24 @@ class SybilModel(nn.Module):
     def forward(self, x):
         return self.layer(x)
 
-# 5. Training Singkat
 model = SybilModel()
-optimizer = optim.Adam(model.parameters(), lr=0.01)
+optimizer = optim.Adam(model.parameters(), lr=0.001)
 criterion = nn.BCELoss()
 
-print("Memulai training...")
 X_tensor = torch.FloatTensor(X_scaled)
 y_tensor = torch.FloatTensor(y)
 
-for epoch in range(100):
+print("Training...")
+for epoch in range(50):
     optimizer.zero_grad()
     outputs = model(X_tensor)
     loss = criterion(outputs, y_tensor)
     loss.backward()
     optimizer.step()
+    if epoch % 10 == 0:
+        print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
 
-# 6. Simpan Model .pt
 torch.save(model.state_dict(), "sybil_detector_real.pt")
-print("Model 'sybil_detector_real.pt' berhasil disimpan!")
+joblib.dump(scaler, "scaler_sybil.pkl")
 
-# Simpan scaler agar bisa dipakai di server .30
-joblib.dump(scaler, 'scaler_sybil.pkl')
-print("File 'scaler_sybil.pkl' berhasil dibuat. Pindahkan ke server!")
+print("✅ Training selesai & model disimpan!")
