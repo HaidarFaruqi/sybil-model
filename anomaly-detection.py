@@ -1,24 +1,24 @@
 import torch
 import torch.nn as nn
-import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
+from scapy.all import sniff, IP, TCP
+from collections import defaultdict
+import time
 
 # =============================
-# MODEL (HARUS IDENTIK DENGAN TRAINING)
+# MODEL
 # =============================
 
 class AutoEncoder(nn.Module):
     def __init__(self, input_dim):
         super().__init__()
-
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, 32),
             nn.ReLU(),
             nn.Linear(32, 16),
             nn.ReLU()
         )
-
         self.decoder = nn.Sequential(
             nn.Linear(16, 32),
             nn.ReLU(),
@@ -30,97 +30,110 @@ class AutoEncoder(nn.Module):
 
 
 # =============================
-# LOAD MODEL CHECKPOINT
+# LOAD MODEL
 # =============================
 
-checkpoint = torch.load("sybil_detector_real.pt")
+checkpoint = torch.load("sybil_detector_real.pt", weights_only=False)
 
-threshold = checkpoint["threshold"]
-
-# =============================
-# FEATURES (WAJIB SAMA & URUTAN SAMA)
-# =============================
-
-features = [
-    "Flow Duration",
-    "Total Fwd Packets",
-    "Total Backward Packets",
-    "Total Length of Fwd Packets",
-    "Total Length of Bwd Packets",
-    "Flow Bytes/s",
-    "Flow Packets/s",
-    "Fwd Packet Length Mean",
-    "Bwd Packet Length Mean",
-    "SYN Flag Count",
-    "RST Flag Count",
-    "PSH Flag Count",
-    "ACK Flag Count",
-    "Average Packet Size"
-]
-
-# =============================
-# REBUILD MODEL
-# =============================
-
-input_dim = len(features)
-model = AutoEncoder(input_dim)
+features = 14  # harus sama seperti training
+model = AutoEncoder(features)
 model.load_state_dict(checkpoint["model_state_dict"])
 model.eval()
 
-# =============================
-# REBUILD SCALER (DARI TRAINING)
-# =============================
+threshold = checkpoint["threshold"]
+if isinstance(threshold, torch.Tensor):
+    threshold = threshold.item()
 
 scaler = StandardScaler()
 scaler.mean_ = checkpoint["scaler_mean"]
 scaler.scale_ = checkpoint["scaler_scale"]
-scaler.n_features_in_ = len(features)
+scaler.n_features_in_ = features
 
 # =============================
-# LOAD TEST DATA
+# FLOW STORAGE
 # =============================
 
-df = pd.read_csv("test_traffic.csv")
-
-df.columns = df.columns.str.strip()
-df.replace([np.inf, -np.inf], 0, inplace=True)
-df.fillna(0, inplace=True)
-
-# Pastikan semua fitur ada
-missing = [f for f in features if f not in df.columns]
-if len(missing) > 0:
-    raise ValueError(f"Missing features in test data: {missing}")
-
-X = df[features].values
-X_scaled = scaler.transform(X)
-
-X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
+flows = defaultdict(lambda: {
+    "start": time.time(),
+    "packets": 0,
+    "bytes": 0,
+    "syn": 0,
+    "ack": 0,
+    "rst": 0,
+    "psh": 0
+})
 
 # =============================
-# DETECTION
+# PACKET HANDLER
 # =============================
 
-with torch.no_grad():
-    reconstructed = model(X_tensor)
-    mse = torch.mean((X_tensor - reconstructed) ** 2, dim=1)
+def process_packet(packet):
+    if IP in packet and TCP in packet:
+        ip = packet[IP]
+        tcp = packet[TCP]
 
-# Convert ke numpy
-mse_np = mse.numpy()
+        key = (ip.src, ip.dst, tcp.sport, tcp.dport)
 
-df["Anomaly_Score"] = mse_np
-df["Prediction"] = ["ANOMALY" if err > threshold else "NORMAL" for err in mse_np]
+        flow = flows[key]
+        flow["packets"] += 1
+        flow["bytes"] += len(packet)
+
+        if tcp.flags & 0x02:
+            flow["syn"] += 1
+        if tcp.flags & 0x10:
+            flow["ack"] += 1
+        if tcp.flags & 0x04:
+            flow["rst"] += 1
+        if tcp.flags & 0x08:
+            flow["psh"] += 1
+
 
 # =============================
-# OUTPUT SUMMARY
+# EVALUATION LOOP
 # =============================
 
-print("\n=== DETECTION SUMMARY ===")
-print(df["Prediction"].value_counts())
+def evaluate_flows():
+    while True:
+        time.sleep(10)
 
-anomaly_ratio = (df["Prediction"] == "ANOMALY").mean() * 100
-print(f"\nAnomaly Percentage: {anomaly_ratio:.2f}%")
+        for key, flow in list(flows.items()):
+            duration = time.time() - flow["start"]
 
-# Save result
-df.to_csv("detection_result.csv", index=False)
+            feature_vector = np.array([[
+                duration,
+                flow["packets"],
+                0,
+                flow["bytes"],
+                0,
+                flow["bytes"] / duration if duration > 0 else 0,
+                flow["packets"] / duration if duration > 0 else 0,
+                0, 0,
+                flow["syn"],
+                flow["rst"],
+                flow["psh"],
+                flow["ack"],
+                flow["bytes"] / flow["packets"] if flow["packets"] > 0 else 0
+            ]])
 
-print("\nDetection finished. Results saved to detection_result.csv")
+            X_scaled = scaler.transform(feature_vector)
+            X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
+
+            with torch.no_grad():
+                reconstructed = model(X_tensor)
+                mse = torch.mean((X_tensor - reconstructed) ** 2)
+
+            if mse.item() > threshold:
+                print(f"⚠ ANOMALY DETECTED from {key[0]} → {key[1]}")
+
+        flows.clear()
+
+
+# =============================
+# START IDS
+# =============================
+
+print("🚀 Real-time IDS running...")
+import threading
+threading.Thread(target=evaluate_flows, daemon=True).start()
+
+sniff(filter="tcp", prn=process_packet, store=0)
