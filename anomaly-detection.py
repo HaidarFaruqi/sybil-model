@@ -1,37 +1,25 @@
-import os
-import pandas as pd
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from sklearn.preprocessing import StandardScaler
+import joblib
+import numpy as np
+from scapy.all import sniff, IP, TCP
+import logging
+import time
+from collections import Counter
 
-# 1. Tentukan Path File (Gunakan file Friday untuk Sybil/DDoS)
-path = r'C:\Users\ASUS\.cache\kagglehub\datasets\chethuhn\network-intrusion-dataset\versions\1'
-file_name = 'Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv'
-full_path = os.path.join(path, file_name)
+# 1. Konfigurasi Logging (Data untuk Bab IV)
+logging.basicConfig(
+    filename='/var/log/hybrid_alerts.log',
+    level=logging.INFO,
+    format='%(asctime)s [HYBRID-IDS] %(message)s'
+)
 
-# 2. Load Data (Gunakan nrows jika RAM laptop terbatas)
-print(f"Sedang memuat data dari: {file_name}")
-df = pd.read_csv(full_path, nrows=50000) 
-
-# Bersihkan nama kolom (dataset ini sering punya spasi di awal nama kolom)
-df.columns = df.columns.str.strip()
-
-# 3. Preprocessing Sederhana
-# Fitur penting untuk Sybil: Bwd Packet Length, Flow Duration, Total Fwd Packets
-features = ['Flow Duration', 'Total Fwd Packets', 'Total Backward Packets', 'Bwd Packet Length Mean']
-X = df[features].fillna(0).values
-y = df['Label'].apply(lambda x: 0 if x == 'BENIGN' else 1).values.reshape(-1, 1)
-
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
-
-# 4. Arsitektur Model Hybrid IDS
+# 2. Arsitektur Model (Wajib SAMA dengan saat training)
 class SybilModel(nn.Module):
     def __init__(self):
         super(SybilModel, self).__init__()
         self.layer = nn.Sequential(
-            nn.Linear(len(features), 16),
+            nn.Linear(4, 16), # 4 Fitur input, 16 Hidden
             nn.ReLU(),
             nn.Linear(16, 1),
             nn.Sigmoid()
@@ -39,22 +27,69 @@ class SybilModel(nn.Module):
     def forward(self, x):
         return self.layer(x)
 
-# 5. Training Singkat
+# 3. Load Model dan Scaler
+device = torch.device('cpu')
 model = SybilModel()
-optimizer = optim.Adam(model.parameters(), lr=0.01)
-criterion = nn.BCELoss()
 
-print("Memulai training...")
-X_tensor = torch.FloatTensor(X_scaled)
-y_tensor = torch.FloatTensor(y)
+try:
+    model.load_state_dict(torch.load('sybil_detector_real.pt', map_location=device))
+    model.eval()
+    scaler = joblib.load('scaler_sybil.pkl')
+    print("✅ Model & Scaler berhasil dimuat!")
+except Exception as e:
+    print(f"❌ Gagal memuat file: {e}")
+    exit()
 
-for epoch in range(100):
-    optimizer.zero_grad()
-    outputs = model(X_tensor)
-    loss = criterion(outputs, y_tensor)
-    loss.backward()
-    optimizer.step()
+# Variabel bantu untuk menghitung fitur secara real-time
+packet_count = 0
+bwd_lengths = []
+start_time = time.time()
 
-# 6. Simpan Model .pt
-torch.save(model.state_dict(), "sybil_detector_real.pt")
-print("Model 'sybil_detector_real.pt' berhasil disimpan!")
+def process_and_predict():
+    global packet_count, bwd_lengths, start_time
+    
+    end_time = time.time()
+    duration = end_time - start_time
+    
+    if packet_count > 0:
+        # Ekstraksi 4 Fitur sesuai training kamu:
+        # ['Flow Duration', 'Total Fwd Packets', 'Total Backward Packets', 'Bwd Packet Length Mean']
+        fwd_pkts = packet_count * 0.6  # Estimasi pembagian fwd/bwd
+        bwd_pkts = packet_count * 0.4
+        bwd_mean = np.mean(bwd_lengths) if bwd_lengths else 0
+        
+        features = np.array([[duration, fwd_pkts, bwd_pkts, bwd_mean]])
+        
+        # WAJIB: Scaling data mentah
+        features_scaled = scaler.transform(features)
+        input_tensor = torch.FloatTensor(features_scaled)
+        
+        with torch.no_grad():
+            score = model(input_tensor).item()
+            
+        # Jika skor tinggi, catat sebagai anomali
+        if score > 0.85:
+            msg = f"ANOMALY_DETECTED | Sybil Attack | Score: {score:.4f} | Pkts: {packet_count}"
+            print(f"🚨 {msg}")
+            logging.info(msg)
+        else:
+            print(f"Healthy Traffic (Score: {score:.4f})")
+
+    # Reset counter untuk window berikutnya
+    packet_count = 0
+    bwd_lengths = []
+    start_time = time.time()
+
+def packet_callback(packet):
+    global packet_count, bwd_lengths
+    if IP in packet:
+        packet_count += 1
+        if packet.haslayer(TCP):
+            bwd_lengths.append(len(packet))
+        
+        # Periksa setiap 2 detik (Windowing)
+        if time.time() - start_time > 2:
+            process_and_predict()
+
+print("🔍 IDS AI sedang memantau Port 80 (Web)...")
+sniff(filter="tcp port 80", prn=packet_callback, store=0)
