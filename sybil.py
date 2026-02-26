@@ -131,6 +131,18 @@ with torch.no_grad():
     mse_per_sample = torch.mean((X_val_tensor - reconstructed) ** 2, dim=1)
     mse_np = mse_per_sample.numpy()
 
+# Buang outliers ekstrem (di atas 99.9 percentile)
+outlier_threshold = np.percentile(mse_np, 99.9)
+mse_clean = mse_np[mse_np <= outlier_threshold]
+
+print(f"Original samples: {len(mse_np)}")
+print(f"After removing outliers: {len(mse_clean)}")
+print(f"Removed: {len(mse_np) - len(mse_clean)} samples")
+
+# Hitung threshold dari data bersih
+threshold = np.percentile(mse_clean, 99.5)
+print(f"Threshold (from cleaned data): {threshold:.6f}")
+
 # Analisis distribusi error
 print("="*60)
 print("RECONSTRUCTION ERROR ANALYSIS (Validation Set)")
