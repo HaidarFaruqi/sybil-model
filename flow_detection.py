@@ -1,15 +1,14 @@
 import torch
 import torch.nn as nn
 import numpy as np
-import joblib
 import time
 import threading
 from scapy.all import sniff, IP, TCP
-from collections import defaultdict
+from sklearn.preprocessing import StandardScaler
 
-############################
-# LOAD MODEL & SCALER
-############################
+###################################
+# AUTOENCODER DEFINITION
+###################################
 
 class AutoEncoder(nn.Module):
     def __init__(self, input_dim):
@@ -31,26 +30,38 @@ class AutoEncoder(nn.Module):
         decoded = self.decoder(encoded)
         return decoded
 
+###################################
+# LOAD CHECKPOINT (MODEL + SCALER + THRESHOLD)
+###################################
 
 INPUT_DIM = 14
-THRESHOLD = 0.01  # sesuaikan dengan training kamu
+
+checkpoint = torch.load("sybil_detector_real.pt", weights_only=False)
 
 model = AutoEncoder(INPUT_DIM)
-model.load_state_dict(torch.load("sybil_detector_real.pt", weights_only=False))
+model.load_state_dict(checkpoint["model_state_dict"])
 model.eval()
 
-scaler = joblib.load("scaler_real.pkl")
+# rebuild scaler
+scaler = StandardScaler()
+scaler.mean_ = checkpoint["scaler_mean"]
+scaler.scale_ = checkpoint["scaler_scale"]
+scaler.n_features_in_ = len(scaler.mean_)
 
-############################
+THRESHOLD = checkpoint["threshold"]
+
+print("Model, scaler, dan threshold berhasil dimuat.")
+
+###################################
 # FLOW STORAGE
-############################
+###################################
 
 FLOW_TIMEOUT = 10
 flows = {}
 
-############################
-# PACKET HANDLER
-############################
+###################################
+# PACKET PROCESSING
+###################################
 
 def process_packet(packet):
     if IP in packet and TCP in packet:
@@ -58,7 +69,6 @@ def process_packet(packet):
         tcp = packet[TCP]
 
         key = (ip.src, ip.dst, tcp.sport, tcp.dport)
-
         now = time.time()
 
         if key not in flows:
@@ -66,8 +76,8 @@ def process_packet(packet):
                 "start": now,
                 "last": now,
                 "packets": [],
-                "fwd_packets": [],
-                "bwd_packets": []
+                "fwd": [],
+                "bwd": []
             }
 
         flow = flows[key]
@@ -75,13 +85,13 @@ def process_packet(packet):
         flow["packets"].append(packet)
 
         if ip.src == key[0]:
-            flow["fwd_packets"].append(packet)
+            flow["fwd"].append(packet)
         else:
-            flow["bwd_packets"].append(packet)
+            flow["bwd"].append(packet)
 
-############################
+###################################
 # FLOW EVALUATION
-############################
+###################################
 
 def evaluate_flows():
     while True:
@@ -92,24 +102,24 @@ def evaluate_flows():
             if now - flow["last"] > FLOW_TIMEOUT:
 
                 duration = flow["last"] - flow["start"]
-                total_fwd = len(flow["fwd_packets"])
-                total_bwd = len(flow["bwd_packets"])
+                total_fwd = len(flow["fwd"])
+                total_bwd = len(flow["bwd"])
                 total_packets = len(flow["packets"])
                 total_bytes = sum(len(p) for p in flow["packets"])
 
-                flow_bytes_per_sec = total_bytes / duration if duration > 0 else 0
-                flow_packets_per_sec = total_packets / duration if duration > 0 else 0
+                bytes_per_sec = total_bytes / duration if duration > 0 else 0
+                packets_per_sec = total_packets / duration if duration > 0 else 0
                 avg_packet_size = total_bytes / total_packets if total_packets > 0 else 0
 
-                # 14 fitur (sesuaikan dengan training kamu)
+                # HARUS SAMA DENGAN FITUR TRAINING
                 features = np.array([[ 
                     duration,
                     total_fwd,
                     total_bwd,
                     total_bytes,
                     total_bytes,
-                    flow_bytes_per_sec,
-                    flow_packets_per_sec,
+                    bytes_per_sec,
+                    packets_per_sec,
                     0, 0, 0, 0, 0, 0,
                     avg_packet_size
                 ]])
@@ -124,7 +134,7 @@ def evaluate_flows():
                 if loss > THRESHOLD:
                     print(f"[ANOMALY] {key} | Loss: {loss:.6f}")
                 else:
-                    print(f"[NORMAL]  {key} | Loss: {loss:.6f}")
+                    print(f"[NORMAL ] {key} | Loss: {loss:.6f}")
 
                 expired.append(key)
 
@@ -133,13 +143,14 @@ def evaluate_flows():
 
         time.sleep(1)
 
-############################
+###################################
 # MAIN
-############################
+###################################
 
 if __name__ == "__main__":
     print("Flow-Based IDS Started...")
-    
+    print(f"Threshold: {THRESHOLD}")
+
     t = threading.Thread(target=evaluate_flows)
     t.daemon = True
     t.start()
