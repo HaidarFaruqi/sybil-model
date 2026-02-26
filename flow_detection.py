@@ -41,7 +41,7 @@ model = AutoEncoder(features)
 model.load_state_dict(checkpoint["model_state_dict"])
 model.eval()
 
-threshold = checkpoint["threshold"]
+threshold = 174.253357
 if isinstance(threshold, torch.Tensor):
     threshold = threshold.item()
 
