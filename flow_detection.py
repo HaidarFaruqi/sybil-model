@@ -6,9 +6,62 @@ from scapy.all import sniff, IP, TCP
 from collections import defaultdict
 import time
 import threading
+import json
+import platform
+import logging
+from logging.handlers import RotatingFileHandler
 
 # =============================
-# MODEL
+# CONFIGURATION
+# =============================
+
+# Detect OS
+IS_LINUX = platform.system() == "Linux"
+
+# Wazuh integration config
+WAZUH_INTEGRATION = True
+WAZUH_LOG_FILE = "/var/log/ml_ids/alerts.log"
+
+# Thresholds
+THRESHOLD_CRITICAL = 10000.0
+THRESHOLD_HIGH = 3000.0
+THRESHOLD_MEDIUM = 1500.0
+THRESHOLD_LOW = 500.0
+
+# =============================
+# LOGGING SETUP
+# =============================
+
+# Setup rotating log handler
+os.makedirs(os.path.dirname(WAZUH_LOG_FILE), exist_ok=True)
+
+logger = logging.getLogger('ML_IDS')
+logger.setLevel(logging.INFO)
+
+# Rotating file handler (10MB max, keep 5 backups)
+handler = RotatingFileHandler(
+    WAZUH_LOG_FILE,
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5
+)
+handler.setLevel(logging.INFO)
+
+# JSON formatter untuk Wazuh
+formatter = logging.Formatter('%(message)s')
+handler.setFormatter(formatter)
+
+logger.addHandler(handler)
+
+# Console handler untuk debug
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger.addHandler(console)
+
+logger.info("ML IDS started with Wazuh integration")
+
+# =============================
+# MODEL DEFINITION
 # =============================
 
 class AutoEncoder(nn.Module):
@@ -41,32 +94,19 @@ model = AutoEncoder(features)
 model.load_state_dict(checkpoint["model_state_dict"])
 model.eval()
 
-threshold = checkpoint["threshold"]  # ← FIX TYPO
-if isinstance(threshold, torch.Tensor):
-    threshold = threshold.item()
+threshold_base = checkpoint["threshold"]
+if isinstance(threshold_base, torch.Tensor):
+    threshold_base = threshold_base.item()
 
 scaler = StandardScaler()
 scaler.mean_ = checkpoint["scaler_mean"]
 scaler.scale_ = checkpoint["scaler_scale"]
 scaler.n_features_in_ = features
 
-print(f"✅ Model loaded. Base threshold: {threshold:.6f}")
+logger.info(f"Model loaded. Base threshold: {threshold_base:.6f}")
 
 # =============================
-# MULTI-THRESHOLD CONFIGURATION
-# =============================
-
-THRESHOLD_HIGH = 1500.0      # High confidence anomaly → Block
-THRESHOLD_MEDIUM = 500.0     # Medium confidence → Alert high priority
-THRESHOLD_LOW = 200.0        # Suspicious → Alert low priority / Log
-
-print(f"🎯 Threshold configuration:")
-print(f"   HIGH (block):       {THRESHOLD_HIGH}")
-print(f"   MEDIUM (alert):     {THRESHOLD_MEDIUM}")
-print(f"   LOW (suspicious):   {THRESHOLD_LOW}")
-
-# =============================
-# BIDIRECTIONAL FLOW STORAGE
+# FLOW STORAGE
 # =============================
 
 flows = defaultdict(lambda: {
@@ -85,22 +125,7 @@ flows = defaultdict(lambda: {
     "fin": 0
 })
 
-# =============================
-# SOURCE IP AGGREGATION (for detecting distributed attacks)
-# =============================
-
-src_stats = defaultdict(lambda: {
-    "total_flows": 0,
-    "suspicious_count": 0,
-    "anomaly_count": 0,
-    "total_syn": 0,
-    "unique_dst_ports": set(),
-    "unique_dst_ips": set(),
-    "last_alert": 0
-})
-
 def normalize_flow_key(src, dst, sport, dport):
-    """Bikin flow key bidirectional (canonical)"""
     endpoint_a = (src, sport)
     endpoint_b = (dst, dport)
     
@@ -118,7 +143,6 @@ def process_packet(packet):
         ip = packet[IP]
         tcp = packet[TCP]
 
-        # Normalisasi key (bidirectional)
         (endpoint_a, endpoint_b, is_forward) = normalize_flow_key(
             ip.src, ip.dst, tcp.sport, tcp.dport
         )
@@ -126,11 +150,9 @@ def process_packet(packet):
         key = (endpoint_a, endpoint_b)
         flow = flows[key]
         
-        # Set originator pertama kali
         if flow["first_endpoint"] is None:
             flow["first_endpoint"] = (ip.src, tcp.sport)
         
-        # Tentukan arah paket ini
         current_endpoint = (ip.src, tcp.sport)
         is_fwd_packet = (current_endpoint == flow["first_endpoint"])
         
@@ -145,204 +167,144 @@ def process_packet(packet):
             flow["bwd_bytes"] += packet_len
             flow["bwd_lengths"].append(packet_len)
 
-        # Flag counts
-        if tcp.flags & 0x02:  # SYN
-            flow["syn"] += 1
-        if tcp.flags & 0x10:  # ACK
-            flow["ack"] += 1
-        if tcp.flags & 0x04:  # RST
-            flow["rst"] += 1
-        if tcp.flags & 0x08:  # PSH
-            flow["psh"] += 1
-        if tcp.flags & 0x01:  # FIN
-            flow["fin"] += 1
+        if tcp.flags & 0x02: flow["syn"] += 1
+        if tcp.flags & 0x10: flow["ack"] += 1
+        if tcp.flags & 0x04: flow["rst"] += 1
+        if tcp.flags & 0x08: flow["psh"] += 1
+        if tcp.flags & 0x01: flow["fin"] += 1
 
 
 # =============================
-# CONTEXTUAL THRESHOLD (per service)
+# WAZUH INTEGRATION
 # =============================
 
-def get_adaptive_threshold(dst_port, duration, packet_count):
+def send_to_wazuh(alert_data):
     """
-    Return adaptive threshold berdasarkan service type
+    Send alert to Wazuh via log file (syslog format)
+    Wazuh agent will read from /var/log/ml_ids/alerts.log
     """
-    # DNS - expect very consistent pattern
-    if dst_port == 53:
-        return 150.0  # Very strict
+    if not WAZUH_INTEGRATION:
+        return
     
-    # HTTP/HTTPS - high variability normal
-    if dst_port in [80, 443]:
-        # Short flows (handshake) should have low MSE
-        if packet_count < 10 and duration < 5:
-            return 300.0
-        # Established connections - more permissive
-        return THRESHOLD_HIGH
+    try:
+        # Format as JSON for Wazuh ingestion
+        wazuh_event = {
+            "timestamp": alert_data["timestamp"],
+            "rule": {
+                "level": alert_data["level"],
+                "description": alert_data["description"],
+                "id": "100001",
+                "groups": ["ml_anomaly", "ids", "intrusion_detection"]
+            },
+            "agent": {
+                "name": platform.node()
+            },
+            "data": {
+                "src_ip": alert_data["src_ip"],
+                "src_port": alert_data["src_port"],
+                "dst_ip": alert_data["dst_ip"],
+                "dst_port": alert_data["dst_port"],
+                "mse": round(alert_data["mse"], 2),
+                "confidence": alert_data["confidence"],
+                "flow_duration": round(alert_data["duration"], 2),
+                "fwd_packets": alert_data["fwd_packets"],
+                "bwd_packets": alert_data["bwd_packets"],
+                "total_bytes": alert_data["total_bytes"]
+            }
+        }
+        
+        # Log to file (Wazuh agent will read this)
+        logger.info(json.dumps(wazuh_event))
+        
+        return True
     
-    # SSH/RDP - long sessions normal
-    if dst_port in [22, 3389]:
-        if duration > 60:
-            return 3000.0  # Very permissive for long sessions
-        return THRESHOLD_MEDIUM
-    
-    # Database ports - expect consistent
-    if dst_port in [3306, 5432, 1433, 27017]:
-        return 600.0  # Stricter
-    
-    # Mail services
-    if dst_port in [25, 587, 110, 143, 993, 995]:
-        return 800.0
-    
-    # Default
-    return THRESHOLD_HIGH
+    except Exception as e:
+        logger.error(f"Failed to send to Wazuh: {e}")
+        return False
 
 
 # =============================
-# MULTI-LAYER DETECTION
+# DETECTION
 # =============================
 
-def detect_anomaly(key, flow, duration, total_packets, total_bytes, mse):
-    """
-    Multi-layer detection:
-    1. Whitelist (skip obvious benign)
-    2. Rule-based (obvious attacks)
-    3. Aggregation (distributed attacks)
-    4. Contextual ML (adaptive threshold)
-    5. Multi-threshold ML (suspicious vs attack)
-    
-    Returns: ("NORMAL" | "SUSPICIOUS" | "ANOMALY", reason, severity)
-    """
-    
+# Streaming services whitelist
+STREAMING_IPS = [
+    "142.250.", "142.251.", "172.217.", "74.125.",  # Google
+    "202.152.",  # Google CDN Indonesia
+]
+
+def is_streaming_service(ip):
+    return any(ip.startswith(prefix) for prefix in STREAMING_IPS)
+
+
+def detect_anomaly_ml_only(key, flow, duration, total_packets, total_bytes, mse):
     src_ip = key[0][0]
     src_port = key[0][1]
     dst_ip = key[1][0]
     dst_port = key[1][1]
     
     # =============================
-    # LAYER 0: WHITELIST (skip benign)
+    # WHITELIST: Streaming Pattern
     # =============================
+    is_streaming = (
+        dst_port == 443 and
+        duration > 30 and
+        total_packets > 200 and
+        is_streaming_service(dst_ip)
+    )
     
-    # Skip monitoring/logging services
-    if dst_port in [1514, 514, 5514]:  # Syslog
-        return ("NORMAL", "whitelist:syslog", 0)
-    
-    # Skip long-lived balanced interactive sessions
-    if duration > 60 and total_packets > 50:
-        ratio = flow["fwd_packets"] / flow["bwd_packets"] if flow["bwd_packets"] > 0 else 999
-        if 0.3 <= ratio <= 3.0 and dst_port in [22, 3389]:
-            return ("NORMAL", "whitelist:interactive_session", 0)
-    
-    # =============================
-    # LAYER 1: RULE-BASED (obvious attacks)
-    # =============================
-    
-    pps = total_packets / duration if duration > 0 else 0
-    bps = total_bytes / duration if duration > 0 else 0
-    avg_packet_size = total_bytes / total_packets if total_packets > 0 else 0
-    
-    # Rule 1: SYN Flood (banyak SYN, no response)
-    if flow["syn"] > 10 and flow["bwd_packets"] == 0:
-        return ("ANOMALY", "rule:syn_flood", 10)
-    
-    # Rule 2: High SYN ratio (port scan signature)
-    syn_ratio = flow["syn"] / total_packets if total_packets > 0 else 0
-    if syn_ratio > 0.5 and total_packets > 10 and flow["bwd_packets"] < 5:
-        return ("ANOMALY", "rule:high_syn_ratio", 9)
-    
-    # Rule 3: Packet flood (high PPS, small packets)
-    if pps > 100 and avg_packet_size < 100:
-        return ("ANOMALY", "rule:packet_flood", 9)
-    
-    # Rule 4: Unbalanced flow (potential flood/scan)
-    if flow["fwd_packets"] > 100 and flow["bwd_packets"] < 10:
-        return ("ANOMALY", "rule:unbalanced_flow", 8)
-    
-    # Rule 5: Excessive packets (volumetric attack)
-    if total_packets > 500 and duration < 10:
-        return ("ANOMALY", "rule:excessive_packets", 8)
-    
-    # Rule 6: High bandwidth (potential DDoS)
-    if bps > 10_000_000:  # 10 MB/s per flow
-        return ("ANOMALY", "rule:high_bandwidth", 7)
+    if is_streaming:
+        if mse < 1000000:  # 1 million MSE untuk streaming = normal
+            return ("NORMAL", "STREAMING", "Normal streaming service", 0)
     
     # =============================
-    # LAYER 2: AGGREGATION (distributed attacks)
+    # ML-BASED DETECTION
     # =============================
     
-    # Update source statistics
-    src_stats[src_ip]["total_flows"] += 1
-    src_stats[src_ip]["total_syn"] += flow["syn"]
-    src_stats[src_ip]["unique_dst_ports"].add(dst_port)
-    src_stats[src_ip]["unique_dst_ips"].add(dst_ip)
+    if mse > THRESHOLD_CRITICAL:
+        confidence = "CRITICAL"
+        level = 12
+        description = f"Critical anomaly detected (MSE: {mse:.0f})"
+        status = "ANOMALY"
     
-    stats = src_stats[src_ip]
+    elif mse > THRESHOLD_HIGH:
+        confidence = "HIGH"
+        level = 10
+        description = f"High confidence anomaly (MSE: {mse:.0f})"
+        status = "ANOMALY"
     
-    # Aggregation Rule 1: Port scanning
-    if len(stats["unique_dst_ports"]) > 20:
-        now = time.time()
-        if now - stats["last_alert"] > 60:  # Alert throttling (1x per minute)
-            stats["last_alert"] = now
-            return ("ANOMALY", "aggregate:port_scan", 9)
+    elif mse > THRESHOLD_MEDIUM:
+        confidence = "MEDIUM"
+        level = 7
+        description = f"Medium confidence anomaly (MSE: {mse:.0f})"
+        status = "ANOMALY"
     
-    # Aggregation Rule 2: Horizontal scanning (many dst IPs)
-    if len(stats["unique_dst_ips"]) > 50:
-        now = time.time()
-        if now - stats["last_alert"] > 60:
-            stats["last_alert"] = now
-            return ("ANOMALY", "aggregate:horizontal_scan", 8)
+    elif mse > THRESHOLD_LOW:
+        confidence = "LOW"
+        level = 5
+        description = f"Suspicious pattern detected (MSE: {mse:.0f})"
+        status = "SUSPICIOUS"
     
-    # Aggregation Rule 3: High SYN from source (distributed SYN flood)
-    if stats["total_syn"] > 100 and stats["total_flows"] > 10:
-        syn_per_flow = stats["total_syn"] / stats["total_flows"]
-        if syn_per_flow > 5:
-            return ("ANOMALY", "aggregate:syn_flood_distributed", 8)
+    else:
+        confidence = "NORMAL"
+        level = 0
+        description = "Normal traffic pattern"
+        status = "NORMAL"
     
-    # =============================
-    # LAYER 3: CONTEXTUAL ML (adaptive threshold)
-    # =============================
-    
-    adaptive_threshold = get_adaptive_threshold(dst_port, duration, total_packets)
-    
-    # =============================
-    # LAYER 4: MULTI-THRESHOLD ML
-    # =============================
-    
-    # Use adaptive threshold for high confidence
-    if mse > adaptive_threshold:
-        severity = min(10, int(mse / adaptive_threshold))  # Scale severity
-        return ("ANOMALY", f"ml:high_confidence(adaptive={adaptive_threshold:.0f})", severity)
-    
-    # Medium threshold
-    if mse > THRESHOLD_MEDIUM:
-        src_stats[src_ip]["anomaly_count"] += 1
-        return ("ANOMALY", f"ml:medium_confidence", 6)
-    
-    # Low threshold (suspicious)
-    if mse > THRESHOLD_LOW:
-        src_stats[src_ip]["suspicious_count"] += 1
-        
-        # If multiple suspicious flows from same source → escalate
-        if stats["suspicious_count"] > 5:
-            return ("ANOMALY", "ml:multiple_suspicious_flows", 5)
-        
-        return ("SUSPICIOUS", f"ml:low_confidence", 3)
-    
-    # Normal
-    return ("NORMAL", "ml:reconstruction_ok", 0)
+    return (status, confidence, description, level)
 
 
 # =============================
 # EVALUATION LOOP
 # =============================
 
-EVAL_INTERVAL = 10  # seconds
+EVAL_INTERVAL = 10
 
-# Statistics
 detection_stats = {
     "total_flows": 0,
     "normal": 0,
     "suspicious": 0,
-    "anomaly": 0,
-    "by_reason": defaultdict(int)
+    "anomaly": 0
 }
 
 def evaluate_flows():
@@ -355,7 +317,6 @@ def evaluate_flows():
         for key, flow in list(flows.items()):
             duration = now - flow["start"]
             
-            # Skip flow yang terlalu baru
             if duration < 1:
                 continue
             
@@ -365,11 +326,9 @@ def evaluate_flows():
             if total_packets == 0:
                 continue
             
-            # Hitung mean packet length per arah
             fwd_mean_len = np.mean(flow["fwd_lengths"]) if flow["fwd_lengths"] else 0
             bwd_mean_len = np.mean(flow["bwd_lengths"]) if flow["bwd_lengths"] else 0
             
-            # 14 fitur SESUAI URUTAN TRAINING
             feature_vector = np.array([[
                 duration,
                 flow["fwd_packets"],
@@ -394,70 +353,53 @@ def evaluate_flows():
                 reconstructed = model(X_tensor)
                 mse = torch.mean((X_tensor - reconstructed) ** 2).item()
 
-            # =============================
-            # MULTI-LAYER DETECTION
-            # =============================
-            
-            status, reason, severity = detect_anomaly(
+            status, confidence, description, level = detect_anomaly_ml_only(
                 key, flow, duration, total_packets, total_bytes, mse
             )
             
-            # Update statistics
             detection_stats["total_flows"] += 1
             detection_stats[status.lower()] += 1
-            detection_stats["by_reason"][reason] += 1
             
-            # Format output
             src_info = f"{key[0][0]}:{key[0][1]}"
             dst_info = f"{key[1][0]}:{key[1][1]}"
-            flow_info = f"FWD:{flow['fwd_packets']} BWD:{flow['bwd_packets']} SYN:{flow['syn']}"
-            pps = total_packets / duration if duration > 0 else 0
+            flow_info = f"FWD:{flow['fwd_packets']} BWD:{flow['bwd_packets']}"
             
             if status == "ANOMALY":
-                emoji = "🚨" if severity >= 8 else "⚠️"
-                print(f"{emoji} [ANOMALY] {src_info} ↔ {dst_info} | {flow_info} | "
-                      f"MSE:{mse:.1f} PPS:{pps:.0f} | Reason:{reason} Severity:{severity}")
+                emoji = "🚨" if confidence == "CRITICAL" else "⚠️"
+                print(f"{emoji} [{confidence}] {src_info} ↔ {dst_info} | {flow_info} | "
+                      f"MSE:{mse:.1f} | {description}")
+                
+                # Send to Wazuh
+                alert_data = {
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "level": level,
+                    "description": description,
+                    "confidence": confidence,
+                    "src_ip": key[0][0],
+                    "src_port": key[0][1],
+                    "dst_ip": key[1][0],
+                    "dst_port": key[1][1],
+                    "mse": mse,
+                    "duration": duration,
+                    "fwd_packets": flow["fwd_packets"],
+                    "bwd_packets": flow["bwd_packets"],
+                    "total_bytes": total_bytes
+                }
+                
+                if send_to_wazuh(alert_data):
+                    print(f"   ↳ Sent to Wazuh (level {level})")
             
             elif status == "SUSPICIOUS":
-                print(f"⚠️  [SUSPICIOUS] {src_info} ↔ {dst_info} | {flow_info} | "
-                      f"MSE:{mse:.1f} | Reason:{reason}")
+                print(f"⚠️  [SUSPICIOUS] {src_info} ↔ {dst_info} | {flow_info} | MSE:{mse:.1f}")
             
             else:  # NORMAL
-                # Only print normal flows occasionally (reduce noise)
-                if detection_stats["total_flows"] % 10 == 0:
+                if detection_stats["total_flows"] % 20 == 0:
                     print(f"✅ [NORMAL] {src_info} ↔ {dst_info} | MSE:{mse:.1f}")
             
             evaluated.append(key)
         
-        # Hapus flow yang sudah dievaluasi
         for key in evaluated:
             del flows[key]
-        
-        # Print statistics periodically
-        if detection_stats["total_flows"] > 0 and detection_stats["total_flows"] % 50 == 0:
-            print_statistics()
-
-
-def print_statistics():
-    """Print detection statistics"""
-    total = detection_stats["total_flows"]
-    normal = detection_stats["normal"]
-    suspicious = detection_stats["suspicious"]
-    anomaly = detection_stats["anomaly"]
-    
-    print("\n" + "="*60)
-    print("📊 DETECTION STATISTICS")
-    print("="*60)
-    print(f"Total flows analyzed: {total}")
-    print(f"  ✅ Normal:      {normal:4d} ({normal/total*100:5.1f}%)")
-    print(f"  ⚠️  Suspicious:  {suspicious:4d} ({suspicious/total*100:5.1f}%)")
-    print(f"  🚨 Anomaly:     {anomaly:4d} ({anomaly/total*100:5.1f}%)")
-    print()
-    print("Top detection reasons:")
-    for reason, count in sorted(detection_stats["by_reason"].items(), 
-                                 key=lambda x: x[1], reverse=True)[:5]:
-        print(f"  - {reason}: {count}")
-    print("="*60 + "\n")
 
 
 # =============================
@@ -465,20 +407,22 @@ def print_statistics():
 # =============================
 
 print("\n" + "="*60)
-print("🚀 Real-time Multi-Layer IDS Starting...")
+print("🚀 ML-Based Anomaly Detection IDS (Linux + Wazuh)")
 print("="*60)
-print("Detection layers:")
-print("  1. Whitelist (skip obvious benign)")
-print("  2. Rule-based (SYN flood, packet flood, scans)")
-print("  3. Aggregation (distributed attacks)")
-print("  4. Contextual ML (adaptive per service)")
-print("  5. Multi-threshold ML (high/medium/low)")
+print(f"System: {platform.system()} {platform.release()}")
+print(f"Wazuh Integration: {'Enabled' if WAZUH_INTEGRATION else 'Disabled'}")
+print(f"Log File: {WAZUH_LOG_FILE}")
+print(f"Thresholds: LOW={THRESHOLD_LOW} MED={THRESHOLD_MEDIUM} HIGH={THRESHOLD_HIGH} CRIT={THRESHOLD_CRITICAL}")
 print("="*60 + "\n")
 
 threading.Thread(target=evaluate_flows, daemon=True).start()
 
 try:
+    # Note: Perlu root untuk sniff!
     sniff(filter="tcp", prn=process_packet, store=0)
+except PermissionError:
+    print("❌ Error: Need root privileges to capture packets")
+    print("   Run with: sudo python3 ids_ml_wazuh.py")
 except KeyboardInterrupt:
     print("\n👋 IDS stopped")
-    print_statistics()
+    logger.info("ML IDS stopped")
